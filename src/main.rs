@@ -4,13 +4,25 @@ use async_recursion::async_recursion;
 use bytes::Bytes;
 use rand::Rng;
 use tokio::sync::{
-    mpsc::{self, Receiver},
+    mpsc::{self, Receiver, Sender},
     Mutex,
 };
 
 #[derive(Default, Debug)]
 struct Follower {
-    voted_for: Option<usize>,
+    voted_for: Option<NodeId>,
+}
+
+impl Follower {
+    pub fn grant_vote(&mut self, candidate_id: NodeId) -> bool {
+        match self.voted_for {
+            Some(_candidate_id) => false,
+            None => {
+                self.voted_for = Some(candidate_id);
+                true
+            }
+        }
+    }
 }
 
 #[derive(Default, Debug)]
@@ -19,7 +31,7 @@ struct Candidate {
 }
 
 impl Candidate {
-    /// Already starts with one vote, since the node votes for itself
+    /// Candidate starts with one vote, since it votes for itself
     fn new() -> Self {
         Self { votes: 1 }
     }
@@ -54,6 +66,7 @@ impl Term {
     }
 }
 
+type Tx = Sender<Option<Bytes>>;
 type Rx = Arc<Mutex<Receiver<Option<Bytes>>>>;
 
 #[derive(Debug)]
@@ -65,7 +78,7 @@ struct Node {
     logs: Logs,
     commit_index: usize,
     last_applied: usize,
-    receiver: Rx,
+    channel: (Tx, Rx),
 }
 
 fn election_timeout_duration() -> Duration {
@@ -79,7 +92,7 @@ fn election_timeout_duration() -> Duration {
 }
 
 impl Node {
-    fn new(id: NodeId, receiver: Rx) -> Node {
+    fn new(id: NodeId, channel: (Tx, Rx)) -> Node {
         Self {
             id,
             term: Term(0),
@@ -88,28 +101,19 @@ impl Node {
             logs: Vec::new(),
             commit_index: 0,
             last_applied: 0,
-            receiver,
+            channel,
         }
     }
 
-    fn convert_to_candidate(&self) -> Node {
-        Node {
-            id: self.id,
-            term: self.term,
-            role: Role::Candidate(Candidate::new()),
-            state: self.state.clone(),
-            logs: self.logs.clone(),
-            commit_index: self.commit_index,
-            last_applied: self.last_applied,
-            receiver: self.receiver.clone(),
-        }
+    fn convert_to_candidate(&mut self) {
+        self.role = Role::Candidate(Candidate::new());
     }
 
     #[async_recursion]
-    pub async fn start_election_timeout(&self) -> Node {
+    pub async fn start_election_timeout(&mut self) {
         let duration = election_timeout_duration();
 
-        let mut rx = self.receiver.lock().await;
+        let mut rx = self.channel.1.lock().await;
 
         match tokio::time::timeout(duration, rx.recv()).await {
             Ok(Some(_)) => self.start_election_timeout().await,
@@ -122,16 +126,83 @@ impl Node {
 }
 
 mod router {
+    use super::*;
     use crate::Node;
-    use axum::{http::StatusCode, response::IntoResponse, routing, Router};
+    use axum::{extract::State, http::StatusCode, response::IntoResponse, routing, Json, Router};
     use std::sync::Arc;
 
-    pub fn configure_router() -> Router<Arc<Node>> {
-        Router::new().route("/heartbeat", routing::post(heartbeat))
+    type AppState = Arc<Mutex<Node>>;
+
+    pub fn configure_router() -> Router<AppState> {
+        Router::new()
+            .route("/appendEntries", routing::post(append_entries))
+            .route("/requestVote", routing::post(request_vote))
     }
 
-    pub async fn heartbeat() -> Result<impl IntoResponse, AppError> {
-        Ok(())
+    // TODO: serde derive deserialize
+    pub struct AppendEntriesPayload {
+        /// Leader's term
+        term: usize,
+        /// So followers can redirect client messages to leader
+        leader_id: NodeId,
+        /// Term of previous log index entry
+        previous_log_term: usize,
+        /// Log entries to be stored (None for heartbeat)
+        entries: Option<Logs>,
+        /// Leader's commit index
+        leader_commit_index: usize,
+    }
+
+    // TODO: serde derive serialize
+    pub struct AppendEntriesResponse {
+        /// Current term, so candidate can update itself
+        term: Term,
+        /// True if follower contained entry matching prev_log_index and prev_log_term
+        success: bool,
+    }
+
+    pub async fn append_entries(
+        State(node): State<AppState>,
+        Json(payload): Json<AppendEntriesPayload>,
+    ) -> Result<Json<AppendEntriesResponse>, AppError> {
+        todo!()
+    }
+
+    // TODO: serde derive deserialize
+    pub struct RequestVotePayload {
+        /// Candidate's term
+        term: Term,
+        /// Candidate requesting vote
+        candidate_id: NodeId,
+        /// Index of candidate's last log
+        last_log_index: usize,
+        /// Term of candidate's last log
+        last_log_term: usize,
+    }
+
+    // TODO: serde derive serialize
+    pub struct RequestVoteResponse {
+        /// Current term, so candidate can update itself
+        current_term: Term,
+        /// True means candidate received vote
+        vote_granted: bool,
+    }
+
+    pub async fn request_vote(
+        State(node): State<AppState>,
+        Json(payload): Json<RequestVotePayload>,
+    ) -> Result<Json<RequestVoteResponse>, AppError> {
+        let mut node = node.lock().await;
+
+        let vote_granted = match &mut node.role {
+            Role::Follower(follower) => follower.grant_vote(payload.candidate_id),
+            _ => todo!(),
+        };
+
+        Ok(Json(RequestVoteResponse {
+            vote_granted,
+            current_term: node.term,
+        }))
     }
 
     pub struct AppError(anyhow::Error);
@@ -140,6 +211,7 @@ mod router {
         fn into_response(self) -> axum::response::Response {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
+                // TODO: use serde to serialize error message in a valid json format
                 format!("Something went wrong: {}", self.0),
             )
                 .into_response()
@@ -158,15 +230,20 @@ mod router {
 
 #[tokio::main]
 async fn main() {
-    // TODO: properly set the buffer len
+    // TODO: what's an appropriate buf len?
     let (tx, rx) = mpsc::channel(100);
     let rx = Arc::new(Mutex::new(rx));
-    let node = Node::new(NodeId(0), rx);
+    let node = Node::new(NodeId(0), (tx, rx));
+    let node = Arc::new(Mutex::new(node));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:6969")
         .await
         .expect("failed to start tcp listener");
-    let app = router::configure_router().with_state(Arc::new(node));
+    let app = router::configure_router().with_state(node.clone());
+
+    tokio::spawn(async move {
+        let pog = node.start_election_timeout().await;
+    });
 
     axum::serve(listener, app)
         .await
